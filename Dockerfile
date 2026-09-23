@@ -10,6 +10,8 @@ COPY web web
 RUN npm run build
 
 FROM node:22-slim
+# The container executor launches sibling containers through the mounted socket.
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /app
 
 # git and openssh so pi can work with real repos; ca-certificates for HTTPS.
@@ -43,6 +45,7 @@ COPY channels channels
 # Skills the portal ships. Loaded from here for every session; anything the
 # agent writes goes to the data volume instead.
 COPY skills skills
+COPY deploy/voice deploy/voice
 
 # HOME lives on the data volume so pi packages and settings (~/.pi/agent)
 # survive image rebuilds instead of being silently wiped.

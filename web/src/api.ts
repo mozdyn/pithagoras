@@ -78,6 +78,8 @@ export interface Routine {
   freshSession: boolean;
   /** False lets this routine act on what it read — see the guard. */
   guard: boolean;
+  /** True lets this routine's runs drive the agent's browser. */
+  browser: boolean;
   /** null inherits the portal default; "" means this one never reports. */
   reportChannel: string | null;
   reportTarget: string | null;
@@ -112,9 +114,30 @@ export interface Workspace {
   isGit: boolean;
 }
 
+export interface CompactionSettings {
+  enabled: boolean;
+  /** The floor a compaction cannot go below — kept verbatim, never summarised. */
+  keepRecentTokens: number;
+}
+
+export interface FileEntry {
+  name: string;
+  type: "dir" | "file";
+  size: number;
+  mtime: number;
+}
+
+export interface FileContent {
+  binary: boolean;
+  size: number;
+  content?: string;
+}
+
 export interface PortalEvent {
   seq: number;
   type: string;
+  /** When the server recorded it, epoch ms. Absent on anything older than the field. */
+  at?: number;
   payload: any;
 }
 
@@ -127,7 +150,47 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
+export const DEFAULT_VAD = { positiveSpeechThreshold: 0.65, negativeSpeechThreshold: 0.35, minSpeechMs: 256, preSpeechPadMs: 320, redemptionMs: 1000 };
+export interface VoiceConfig {
+  sentenceChunks?: boolean;
+  ttsPrefetch?: boolean;
+  comparison?: boolean;
+  statusSpeech?: boolean;
+  pipelineMode?: "parallel" | "sequential";
+  vad?: typeof DEFAULT_VAD;
+  enabled: boolean; lazyLoad?: boolean; managed?: boolean; whisperUrl: string; breezeUrl: string; instruction: string; voice?: string; language?: string; cfgScale?: number; runtime?: "breeze" | "audio-cpp" | "chatterbox"; sttModel?: string; exaggeration?: number;
+}
+
+export interface VoiceInstallStatus { available: boolean; state: string; busy: boolean; progress: string; error: string; }
 export const api = {
+
+  listFiles: (workspace: string, dirPath: string) =>
+    json<{ path: string; entries: FileEntry[] }>(
+      `/api/workspaces/${encodeURIComponent(workspace)}/files?path=${encodeURIComponent(dirPath)}`
+    ),
+  readFile: (workspace: string, filePath: string) =>
+    json<FileContent>(
+      `/api/workspaces/${encodeURIComponent(workspace)}/file?path=${encodeURIComponent(filePath)}`
+    ),
+  saveFile: (workspace: string, filePath: string, content: string) =>
+    json<{ ok: true; size: number; mtime: number }>(
+      `/api/workspaces/${encodeURIComponent(workspace)}/file?path=${encodeURIComponent(filePath)}`,
+      { method: "PUT", body: JSON.stringify({ content }) }
+    ),
+  deleteFile: (workspace: string, filePath: string) =>
+    json<{ ok: true }>(
+      `/api/workspaces/${encodeURIComponent(workspace)}/file?path=${encodeURIComponent(filePath)}`,
+      { method: "DELETE" }
+    ),
+  fileDownloadUrl: (workspace: string, filePath: string) =>
+    `/api/workspaces/${encodeURIComponent(workspace)}/file?path=${encodeURIComponent(filePath)}&download=1`,
+  archiveDownloadUrl: (workspace: string) =>
+    `/api/workspaces/${encodeURIComponent(workspace)}/archive`,
+  voiceInstallStatus: () => json<VoiceInstallStatus>('/api/voice/install'),
+  voiceAction: (action: 'install' | 'start' | 'stop') => json<{ok:boolean}>(`/api/voice/${action}`, {method:'POST'}),
+  connectVoice: () => json<VoiceConfig>('/api/voice/connect', {method:'POST'}),
+  voice: () => json<VoiceConfig>("/api/voice"),
+  setVoice: (value: VoiceConfig) => json<VoiceConfig>("/api/voice", { method: "PUT", body: JSON.stringify(value) }),
   authStatus: () => json<{ authRequired: boolean; authed: boolean }>("/api/auth/status"),
   login: (password: string) =>
     json<{ ok: true }>("/api/auth/login", { method: "POST", body: JSON.stringify({ password }) }),
@@ -143,13 +206,22 @@ export const api = {
   renameSession: (id: string, title: string) =>
     json<Session>(`/api/sessions/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   deleteSession: (id: string) => json<{ ok: true }>(`/api/sessions/${id}`, { method: "DELETE" }),
-  prompt: (id: string, message: string) =>
+  prompt: (id: string, message: string, options?: { voice?: boolean }) =>
     json<{ ok: true }>(`/api/sessions/${id}/prompt`, {
+      method: "POST",
+      body: JSON.stringify({ message, ...(options?.voice ? { voice: true } : {}) }),
+    }),
+  /** Removes a message and the agent's answer to it — from the agent's memory too. */
+  deleteMessage: (id: string, seq: number) =>
+    json<{ ok: true }>(`/api/sessions/${id}/messages/${seq}`, { method: "DELETE" }),
+  /** Replaces a message: it and everything after it are dropped, and the new text is sent. */
+  editMessage: (id: string, seq: number, message: string) =>
+    json<{ ok: true }>(`/api/sessions/${id}/messages/${seq}/edit`, {
       method: "POST",
       body: JSON.stringify({ message }),
     }),
   respondUi: (sessionId: string, id: string, payload: { value?: unknown; cancelled?: boolean }) =>
-    json<{ ok: boolean }>(`/api/sessions/${sessionId}/ui-response`, {
+    json<{ ok: boolean; note?: string }>(`/api/sessions/${sessionId}/ui-response`, {
       method: "POST",
       body: JSON.stringify({ id, ...payload }),
     }),
@@ -211,6 +283,52 @@ export const api = {
     json<{ ok: true }>(`/api/skills/${encodeURIComponent(name)}`, { method: "DELETE" }),
 
   people: () => json<{ people: Person[] }>("/api/people"),
+  browser: () => json<BrowserStatus>("/api/browser"),
+  openTerminal: (sessionId?: string) =>
+    json<{ id: string; cwd: string }>("/api/terminal", {
+      method: "POST",
+      body: JSON.stringify({ sessionId }),
+    }),
+  terminalInput: (id: string, data: string) =>
+    json<{ ok: true }>(`/api/terminal/${id}/input`, {
+      method: "POST",
+      body: JSON.stringify({ data }),
+    }),
+  terminalResize: (id: string, rows: number, cols: number) =>
+    json<{ ok: true }>(`/api/terminal/${id}/resize`, {
+      method: "POST",
+      body: JSON.stringify({ rows, cols }),
+    }),
+  closeTerminal: (id: string) => json<{ ok: true }>(`/api/terminal/${id}`, { method: "DELETE" }),
+  installBrowser: () => json<{ ok: true }>("/api/browser/install", { method: "POST" }),
+  startBrowser: () => json<{ ok: true }>("/api/browser/start", { method: "POST" }),
+  stopBrowser: () => json<{ ok: true }>("/api/browser/stop", { method: "POST" }),
+  removeBrowser: (forgetProfile = false) =>
+    json<{ ok: true }>(`/api/browser/install${forgetProfile ? "?profile=forget" : ""}`, {
+      method: "DELETE",
+    }),
+  setBrowserConfig: (patch: { user?: string; password?: string }) =>
+    json<{ user: string; hasPassword: boolean }>("/api/browser/config", {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+  suggestBrowserPassword: () =>
+    json<{ password: string }>("/api/browser/suggest-password"),
+  connectBrowser: () =>
+    json<{ connectedAs: string | null }>("/api/browser/connect", { method: "POST" }),
+  disconnectBrowser: () =>
+    json<{ connectedAs: string | null }>("/api/browser/connect", { method: "DELETE" }),
+  setBrowserAllowlist: (domains: string) =>
+    json<{ allowlist: string }>("/api/browser/allowlist", {
+      method: "PUT",
+      body: JSON.stringify({ domains }),
+    }),
+  setSessionBrowser: (id: string, enabled: boolean) =>
+    json<{ enabled: boolean }>(`/api/sessions/${id}/browser`, {
+      method: "PUT",
+      body: JSON.stringify({ enabled }),
+    }),
+
   audit: (limit = 200) => json<{ entries: AuditEntry[] }>(`/api/audit?limit=${limit}`),
   toolRules: () => json<{ rules: ToolRule[] }>("/api/tool-rules"),
   addToolRule: (rule: {
@@ -263,6 +381,7 @@ export const api = {
       enabled?: boolean;
       freshSession?: boolean;
       guard?: boolean;
+      browser?: boolean;
       reportChannel?: string | null;
       reportTarget?: string | null;
     }
@@ -292,6 +411,10 @@ export const api = {
     }),
 
   /** Any session by id, including agent and routine ones the task list omits. */
+  olderEvents: (id: string, before: number, limit = 1200) =>
+    json<{ events: PortalEvent[]; more: boolean }>(
+      `/api/sessions/${id}/events/before?before=${before}&limit=${limit}`
+    ),
   session: (id: string) => json<Session>(`/api/sessions/${id}`),
   startAgentChat: (title?: string) =>
     json<Session>("/api/agent/sessions", { method: "POST", body: JSON.stringify({ title }) }),
@@ -336,11 +459,20 @@ export const api = {
       /** What an unset field falls back to: env, else pi's settings.json. */
       defaults: GlobalSettings;
       piSettingsPath: string;
+      /** pi's own compaction tuning, which lives in its settings.json not ours. */
+      compaction: CompactionSettings;
+      compactionDefaults: CompactionSettings;
       executor: string;
       workspaceRoot: string;
     }>("/api/settings"),
-  saveSettings: (patch: Partial<GlobalSettings>) =>
-    json<{ settings: GlobalSettings; note: string }>("/api/settings", {
+  saveSettings: (patch: Partial<GlobalSettings> & { keepRecentTokens?: number }) =>
+    json<{
+      settings: GlobalSettings;
+      compaction: CompactionSettings;
+      /** How many open sessions took the new compaction settings. */
+      refreshed: number;
+      note: string;
+    }>("/api/settings", {
       method: "PUT",
       body: JSON.stringify(patch),
     }),
@@ -632,4 +764,30 @@ export interface AuditEntry {
   person_key: string | null;
   person_name: string | null;
   session_id: string | null;
+}
+
+/** The agent's browser, and who may drive it. */
+export interface BrowserStatus {
+  running: boolean;
+  /** Running with no password on its web UI. */
+  unprotected: boolean;
+  /** The MCP server wiring the agent to this browser, if any. */
+  connectedAs: string | null;
+  /** How and whether a browser can run here at all. */
+  install: {
+    available: boolean;
+    mode?: "docker" | "local";
+    image: boolean;
+    container: "absent" | "stopped" | "running" | "unavailable";
+    binary?: string | null;
+    headless?: boolean;
+    pulling: { active: boolean; line: string; error?: string };
+  };
+  config: { user: string; hasPassword: boolean };
+  version: string | null;
+  pages: { title: string; url: string }[];
+  uiPort: string;
+  allowlist: string;
+  sessions: { id: string; title: string; kind: string }[];
+  routines: { slug: string; name: string }[];
 }

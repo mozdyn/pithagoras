@@ -1,4 +1,8 @@
-import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { bindHost, loginThrottle, portalSecurityHeaders } from "./http-security.js";
+import { canvasesRouter } from "./api/canvases.js";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -7,6 +11,7 @@ import { nanoid } from "nanoid";
 import {
   createSession,
   deleteSession,
+  eventsBefore,
   eventsSince,
   replayStart,
   getSession,
@@ -27,31 +32,45 @@ import { packagesRouter } from "./api/packages.js";
 import { extensionsRouter } from "./api/extensions.js";
 import { channelsRouter } from "./api/channels.js";
 import { routinesRouter } from "./api/routines.js";
+import { filesRouter } from "./api/files.js";
 import { skillsRouter } from "./api/skills.js";
 import { mcpRouter } from "./api/mcp.js";
 import { peopleRouter } from "./api/people.js";
+import { voiceRouter } from "./api/voice.js";
+import { browserRouter } from "./api/browser.js";
+import { terminalRouter } from "./api/terminal.js";
+import { attachBrowserUpgrade, mountBrowserProxy } from "./browser-proxy.js";
+import { watchBrowserFrames } from "./extensions/browser-frames.js";
+import { startLlamaProxy } from "./llama-progress.js";
+import { pinConnection } from "./api/browser.js";
 import { routineSupervisor } from "./routines/supervisor.js";
 import { channelSupervisor } from "./channels/supervisor.js";
-import { piSettingsPath } from "./pi-settings.js";
-import { getDb } from "./db.js";
+import {
+  COMPACTION_DEFAULTS,
+  piSettingsPath,
+  readCompactionSettings,
+  writeCompactionSettings,
+} from "./pi-settings.js";
+import { eventTime, getDb } from "./db.js";
 import { getBuiltinCommands } from "./pi/builtins.js";
+import { SessionEditError } from "./pi/session-edit.js";
 import { isValidSlug, slugify } from "./slug.js";
 import { getSettingDefaults, getSettings, getStoredSettings, setSettings } from "./db.js";
 
-// WORKSPACE_ROOT is the new name; WORKSPACE_ROOT still works for existing deploys.
+// WORKSPACE_ROOT is the new name; WORKSPACES_DIR still works for existing deploys.
 const WORKSPACE_ROOT = path.resolve(
-  process.env.WORKSPACE_ROOT || process.env.WORKSPACE_ROOT || "/workspaces"
+  process.env.WORKSPACE_ROOT || process.env.WORKSPACES_DIR || "/workspaces"
 );
 const PORT = Number(process.env.PORT || 4100);
 /**
  * How much of a long conversation a fresh page load replays.
  *
- * Not a correctness limit — a reconnect with a cursor still receives everything
- * it missed. This is only how far back a browser opening the session cold has
- * to scroll, and shipping 70,000 events to render a chat window is its own kind
- * of broken.
+ * Small on purpose. Not a correctness limit — a reconnect with a cursor still
+ * receives everything it missed, and older events are fetched on demand as you
+ * scroll back. Replaying twenty thousand meant a refresh rendered the entire
+ * history and then visibly scrolled through it.
  */
-const REPLAY_EVENTS = 20_000;
+const REPLAY_EVENTS = 1_200;
 /** Persistent place for CLIs, kept on PATH so pi and its tools can reach them. */
 const BIN_DIR = path.resolve(process.env.BIN_DIR || "/data/bin");
 
@@ -65,7 +84,7 @@ app.get("/api/auth/status", (req, res) => {
   res.json({ authRequired: authEnabled, authed: isAuthed(req) });
 });
 
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", loginThrottle(), (req, res) => {
   if (!authEnabled) return res.json({ ok: true });
   if (!checkPassword(req.body?.password)) {
     return res.status(401).json({ error: "Wrong password" });
@@ -87,21 +106,75 @@ app.get("/api/settings", (_req, res) => {
     stored: getStoredSettings(),
     defaults: getSettingDefaults(),
     piSettingsPath: piSettingsPath(),
+    // pi's own, not the portal's — kept separate in the response so the UI can
+    // say which file a value lives in.
+    compaction: readCompactionSettings(),
+    compactionDefaults: COMPACTION_DEFAULTS,
     executor: EXECUTOR_KIND,
     workspaceRoot: WORKSPACE_ROOT,
   });
 });
 
-app.put("/api/settings", (req, res) => {
+app.put("/api/settings", async (req, res) => {
   const { provider, model, thinkingLevel } = req.body ?? {};
   const patch: Record<string, string> = {};
   if (typeof provider === "string") patch.provider = provider.trim();
   if (typeof model === "string") patch.model = model.trim();
   if (typeof thinkingLevel === "string") patch.thinkingLevel = thinkingLevel.trim();
+  // Checked before anything is written. Rejecting half way through left the
+  // provider changed on a request that answered 400, which is a worse outcome
+  // than either accepting or refusing the lot. Rejected rather than clamped
+  // too: a number that silently becomes a different number is worse than being
+  // told it was wrong.
+  const keep = req.body?.keepRecentTokens;
+
+  // The two live in different stores — the portal's database and pi's own
+  // settings file — and there is no way to write both or neither. Committing
+  // one and failing the other would answer with an error after half the change
+  // had landed, so a request is not allowed to ask for both. Nothing sends
+  // one: the sliders save on release, on their own, and Save defaults carries
+  // only the fields above it.
+  const wantsDefaults = ["provider", "model", "thinkingLevel"].some(
+    (k) => typeof req.body?.[k] === "string",
+  );
+  if (keep !== undefined && wantsDefaults) {
+    return res.status(400).json({
+      error: "Save the session defaults and the compaction setting separately — they are stored in different files",
+    });
+  }
+
+  let tokens: number | undefined;
+  if (keep !== undefined) {
+    tokens = Number(keep);
+    if (!Number.isFinite(tokens) || tokens < 1000 || tokens > 500_000) {
+      return res.status(400).json({ error: "Keep recent must be between 1,000 and 500,000 tokens" });
+    }
+    tokens = Math.round(tokens);
+  }
+
   const settings = setSettings(patch);
-  // Existing sessions keep their own settings; this applies to sessions started
-  // from here on, which matches how the TUI treats a changed default.
-  res.json({ settings, note: "Applies to newly started sessions" });
+
+  // Compaction lives in pi's file rather than the portal's, because pi is what
+  // reads it.
+  const compaction =
+    tokens !== undefined
+      ? await writeCompactionSettings({ keepRecentTokens: tokens })
+      : readCompactionSettings();
+
+  // The provider and model defaults apply to sessions started from here on,
+  // which matches how the TUI treats a changed default. Compaction is pushed
+  // into open sessions as well — the session you are looking at when you
+  // change it is the one you meant it for.
+  const refreshed = tokens !== undefined ? await sessions.refreshSettings() : 0;
+  res.json({
+    settings,
+    compaction,
+    refreshed,
+    note:
+      tokens !== undefined
+        ? `Compaction applied to ${refreshed} open session${refreshed === 1 ? "" : "s"}. Model and effort apply to newly started sessions.`
+        : "Applies to newly started sessions",
+  });
 });
 
 // --- workspaces ---
@@ -310,10 +383,40 @@ app.post("/api/sessions/:id/prompt", async (req, res) => {
   try {
     // Returns as soon as pi accepts the prompt. The run continues server-side
     // regardless of what this browser does next.
-    await sessions.prompt(session.id, message);
+    await sessions.prompt(session.id, message, { voice: req.body?.voice === true });
     res.json({ ok: true, status: "running" });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// --- editing the conversation ---
+
+const editStatus = { busy: 409, missing: 404 } as const;
+
+/** Removes a message and the agent's answer to it. */
+app.delete("/api/sessions/:id/messages/:seq", async (req, res) => {
+  try {
+    await sessions.removeMessage(req.params.id, Number(req.params.seq), "turn");
+    res.json({ ok: true });
+  } catch (e) {
+    if (!(e instanceof SessionEditError)) return res.status(500).json({ error: (e as Error).message });
+    res.status(editStatus[e.code as keyof typeof editStatus] ?? 422).json({ error: e.message });
+  }
+});
+
+/** Replaces a message: it and everything after it are dropped, and the new text is sent. */
+app.post("/api/sessions/:id/messages/:seq/edit", async (req, res) => {
+  const message = req.body?.message;
+  if (typeof message !== "string" || !message.trim()) {
+    return res.status(400).json({ error: "message required" });
+  }
+  try {
+    await sessions.editMessage(req.params.id, Number(req.params.seq), message);
+    res.json({ ok: true, status: "running" });
+  } catch (e) {
+    if (!(e instanceof SessionEditError)) return res.status(500).json({ error: (e as Error).message });
+    res.status(editStatus[e.code as keyof typeof editStatus] ?? 422).json({ error: e.message });
   }
 });
 
@@ -410,7 +513,7 @@ app.post("/api/sessions/:id/config", async (req, res) => {
   try {
     const client = await sessions.client(session.id);
     if (typeof modelId === "string" && modelId) {
-      await client.setModel(provider || getSettings().provider, modelId);
+      await client.setModel(provider || session.provider || getSettings().provider, modelId);
       applied.push("model");
     }
     if (typeof thinkingLevel === "string" && thinkingLevel) {
@@ -452,10 +555,12 @@ app.post("/api/sessions/:id/compact", async (req, res) => {
   const session = getSession(req.params.id);
   if (!session) return res.status(404).json({ error: "Not found" });
   try {
-    const client = await sessions.client(session.id);
-    await client.compact();
+    await sessions.compact(session.id);
     res.json({ ok: true });
   } catch (e) {
+    // The message alone reaches the browser, and "Cannot read properties of
+    // undefined" says nothing about where. The stack stays here.
+    console.error(`[portal] compaction failed for ${session.id}:`, e);
     res.status(500).json({ error: (e as Error).message });
   }
 });
@@ -487,8 +592,15 @@ app.use("/api", extensionsRouter());
 app.use("/api", channelsRouter());
 app.use("/api", routinesRouter());
 app.use("/api", skillsRouter());
+app.use("/api", filesRouter());
 app.use("/api", mcpRouter());
 app.use("/api", peopleRouter());
+app.use("/api", browserRouter());
+app.use("/api", voiceRouter());
+app.use("/api", terminalRouter());
+app.use("/api", canvasesRouter());
+// Before the SPA fallback, which answers everything that is not /api.
+mountBrowserProxy(app);
 
 // --- event stream ---
 
@@ -497,6 +609,25 @@ app.use("/api", peopleRouter());
  * after minutes or days delivers exactly what was missed and then continues
  * live — no gap, no duplicates.
  */
+/** What came before a cursor: the transcript scrolling back rather than forward. */
+app.get("/api/sessions/:id/events/before", (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) return res.status(404).json({ error: "Not found" });
+  const before = Number(req.query.before ?? 0) || 0;
+  const limit = Math.min(Number(req.query.limit) || 1200, 3000);
+  const rows = eventsBefore(session.id, before, limit);
+  res.json({
+    events: rows.map((r) => ({
+      seq: r.seq,
+      type: r.type,
+      at: eventTime(r.created_at),
+      payload: JSON.parse(r.payload),
+    })),
+    // Whether asking again would return anything, so the UI knows to stop.
+    more: rows.length === limit,
+  });
+});
+
 app.get("/api/sessions/:id/events", (req, res) => {
   const session = getSession(req.params.id);
   if (!session) return res.status(404).json({ error: "Not found" });
@@ -510,13 +641,19 @@ app.get("/api/sessions/:id/events", (req, res) => {
     "X-Accel-Buffering": "no",
   });
 
-  const write = (row: { seq: number; type: string; payload: string }) => {
-    res.write(`id: ${row.seq}\ndata: ${JSON.stringify({
+  const write = (row: { seq: number; type: string; payload: string; created_at?: string }) => {
+    res.write(`${row.seq > 0 ? `id: ${row.seq}\n` : ""}data: ${JSON.stringify({
       seq: row.seq,
       type: row.type,
+      // What the activity line counts from, so a refresh mid-run still knows
+      // how long the agent has been on this rather than starting from zero.
+      at: eventTime(row.created_at),
       payload: JSON.parse(row.payload),
     })}\n\n`);
   };
+
+  // Replace stale in-memory deltas before durable replay, then restore the current snapshot.
+  res.write("event: live-reset\ndata: {}\n\n");
 
   // A fresh load gets the end of the conversation, not the beginning. Replaying
   // from zero and stopping at the batch limit is how a long session came back
@@ -537,9 +674,10 @@ app.get("/api/sessions/:id/events", (req, res) => {
     }
     if (batch.length < 5000) break;
   }
+  for (const row of sessions.liveSnapshot(session.id)) write(row);
   res.write(`event: caught-up\ndata: ${JSON.stringify({ seq: lastSent })}\n\n`);
 
-  const onEvent = (row: { seq: number; type: string; payload: string }) => {
+  const onEvent = (row: { seq: number; type: string; payload: string; created_at?: string }) => {
     // Live-only events carry a negative seq: deliver them, but never let one
     // move the replay cursor, or a reconnect would skip stored history.
     if (row.seq < 0) {
@@ -564,6 +702,7 @@ app.get("/api/sessions/:id/events", (req, res) => {
 
 const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web/dist");
 if (existsSync(webDist)) {
+  app.use(portalSecurityHeaders);
   app.use(express.static(webDist));
   app.get(/^(?!\/api).*/, (_req, res) => res.sendFile(path.join(webDist, "index.html")));
 }
@@ -573,8 +712,25 @@ if (existsSync(webDist)) {
 // PATH entry pointing at nothing.
 mkdirSync(BIN_DIR, { recursive: true });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`pithagoras listening on :${PORT}`);
+/**
+ * TLS when a certificate is supplied, plain HTTP otherwise.
+ *
+ * Optional because most deployments sit on a LAN or a tailnet and do not want
+ * to think about certificates. Needed for the embedded browser, which refuses
+ * to run unless every page above it is a secure context.
+ */
+const tlsCert = process.env.PORTAL_TLS_CERT;
+const tlsKey = process.env.PORTAL_TLS_KEY;
+const tls =
+  tlsCert && tlsKey && existsSync(tlsCert) && existsSync(tlsKey)
+    ? { cert: readFileSync(tlsCert), key: readFileSync(tlsKey) }
+    : null;
+
+const server = (tls ? createHttpsServer(tls, app) : createHttpServer(app)).listen(
+  PORT,
+  bindHost(process.env.PORTAL_PASSWORD, process.env.ALLOW_OPEN),
+  () => {
+  console.log(`pithagoras listening on :${PORT}${tls ? " (https)" : ""}`);
   console.log(`  local bin: ${BIN_DIR}`);
   console.log(`  executor: ${EXECUTOR_KIND}`);
   console.log(`  workspaces: ${WORKSPACE_ROOT}`);
@@ -582,15 +738,24 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 
   // Enabled channels come up with the server, so a restart does not silently
   // leave the agent unreachable.
-  // Schedules resume with the server; a routine due while it was down does not
-  // fire retroactively, it simply waits for its next slot.
+  // Recurring schedules wait for their next slot; overdue one-off routines catch up.
   routineSupervisor.start();
 
   channelSupervisor
     .sync()
     .then(() => console.log(`  channels: ${channelSupervisor.summary()}`))
     .catch((e) => console.error(`[portal] channel startup failed: ${e.message}`));
-});
+  }
+);
+
+attachBrowserUpgrade(server);
+// Keeps the agent's browser rendering when nobody has the panel open.
+watchBrowserFrames();
+// Reports how far llama.cpp has got through a prompt, which is otherwise a
+// silent minute or two before the first token.
+startLlamaProxy((sessionId, prefill) => sessions.reportPrefill(sessionId, prefill));
+getDb().prepare("UPDATE canvases SET active_call = NULL, status = 'interrupted', agent_read_revision = revision WHERE active_call IS NOT NULL").run();
+pinConnection();
 
 async function shutdown(signal: string) {
   console.log(`${signal} received — stopping running sessions`);

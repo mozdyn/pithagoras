@@ -10,15 +10,15 @@ import type { NextFunction, Request, Response } from "express";
  */
 const PASSWORD = process.env.PORTAL_PASSWORD || "";
 const SECRET = process.env.PORTAL_SECRET || crypto.randomBytes(32).toString("hex");
-const COOKIE = "pi_portal_auth";
+const COOKIE = (process.env.VOICE_COMPARISON === "true" || process.env.VOICE_PIPELINE_MODE === "sequential") ? "pi_portal_sequential_auth" : "pi_portal_auth";
 const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 export const authEnabled = PASSWORD.length > 0;
 
 if (!authEnabled) {
   console.warn(
-    "\n  WARNING: PORTAL_PASSWORD is not set — the portal is open to anyone who\n" +
-      "  can reach it, and it can run arbitrary commands on this machine.\n" +
+    "\n  WARNING: PORTAL_PASSWORD is not set — authentication is disabled.\n" +
+      "  The portal binds loopback unless ALLOW_OPEN=1 explicitly exposes it.\n" +
       "  Set PORTAL_PASSWORD (and PORTAL_SECRET to keep logins across restarts).\n"
   );
 }

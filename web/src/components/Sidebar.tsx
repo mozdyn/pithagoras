@@ -2,7 +2,10 @@ import { useState, type ReactNode } from "react";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import {
   LuBot,
+  LuPanelLeftClose,
+  LuPanelLeftOpen,
   LuClock,
+  LuGlobe,
   LuMessagesSquare,
   LuPin,
   LuPinOff,
@@ -46,11 +49,13 @@ function slugify(input: string): string {
 const NEW = "__new__";
 
 export function Sidebar({
+  forceExpanded = false,
   sessions,
   workspaces,
   executor,
   activeId,
   view,
+  hasBrowser,
   onSelect,
   onCreate,
   onDelete,
@@ -60,12 +65,15 @@ export function Sidebar({
   onOpenSettings,
   onNavigate,
 }: {
+  forceExpanded?: boolean;
   sessions: Session[];
   workspaces: Workspace[];
   executor: string;
   activeId: string | null;
   /** Which top-level destination is showing, so the nav can mark it. */
-  view: "chat" | "sessions" | "agent" | "routines" | "audit";
+  view: "chat" | "sessions" | "agent" | "routines" | "browser" | "audit";
+  /** Whether the optional browser service is there at all. */
+  hasBrowser: boolean;
   onSelect: (id: string) => void;
   onCreate: (workspacePath: string) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
@@ -73,8 +81,16 @@ export function Sidebar({
   onPin: (id: string, pinned: boolean) => Promise<void>;
   onCreateWorkspace: (name: string) => Promise<Workspace>;
   onOpenSettings: () => void;
-  onNavigate: (to: "sessions" | "agent" | "routines" | "audit") => void;
+  onNavigate: (to: "sessions" | "agent" | "routines" | "browser" | "audit") => void;
 }) {
+  const [storedCollapsed, setCollapsed] = useState(() => localStorage.getItem("sidebarCollapsed") === "true");
+  const collapsed = forceExpanded ? false : storedCollapsed;
+  const toggleSidebar = () => {
+    setCollapsed(value => {
+      localStorage.setItem("sidebarCollapsed", String(!value));
+      return !value;
+    });
+  };
   const [creating, setCreating] = useState(false);
   const [choice, setChoice] = useState<string>(NEW);
   const [name, setName] = useState("");
@@ -121,8 +137,15 @@ export function Sidebar({
   );
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-line bg-surface">
-      <div className="flex items-center gap-2 px-3 pb-3 pt-4">
+    <aside aria-label="Sidebar" className={`relative flex shrink-0 flex-col overflow-hidden border-r border-line bg-surface transition-[width] duration-300 ease-in-out motion-reduce:transition-none ${collapsed ? "w-12" : "w-64"}`}>
+      <button type="button" onClick={toggleSidebar} aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        title={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="sidebar-content"
+        className="hidden md:grid absolute right-2 top-3 z-10 grid h-8 w-8 place-items-center rounded-lg text-fg-subtle transition-colors hover:bg-canvas hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
+        {collapsed ? <LuPanelLeftOpen size={18} /> : <LuPanelLeftClose size={18} />}
+      </button>
+      <div id="sidebar-content" className={`min-h-0 w-64 flex-1 flex-col ${collapsed ? "hidden" : "flex"}`}>
+
+      <div className="flex items-center gap-2 pl-3 pr-12 pb-3 pt-4">
         <img
           src="/logo-192.png"
           alt=""
@@ -159,6 +182,16 @@ export function Sidebar({
           onClick={() => onNavigate("routines")}
           active={view === "routines"}
         />
+        {/* Hidden unless there is one. The browser is an optional service, and
+            a dead link to a feature you did not install is just clutter. */}
+        {hasBrowser && (
+          <NavItem
+            icon={<LuGlobe />}
+            label="Browser"
+            onClick={() => onNavigate("browser")}
+            active={view === "browser"}
+          />
+        )}
         <NavItem
           icon={<LuShield />}
           label="Audit"
@@ -258,6 +291,7 @@ export function Sidebar({
           </div>
           <ThemeSwitcher />
         </div>
+      </div>
       </div>
     </aside>
   );

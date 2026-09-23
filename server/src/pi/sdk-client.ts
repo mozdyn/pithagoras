@@ -1,3 +1,7 @@
+import { CanvasTools } from "./canvas-tools.js";
+import { acceptPrompt } from "./accept-prompt.js";
+import { VoiceFirstTurn, audioSystemRules, audioMessage } from "./voice-first.js";
+import { BROWSER_READING_RULE, BROWSER_SCREENSHOT_RULE } from "./browser-snapshot.js";
 import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -8,6 +12,7 @@ import { routineTools } from "./routine-tools.js";
 import { reportTool, reportToFor } from "./report-tool.js";
 import { guardExtension } from "./guard.js";
 import { askPrimaryTool } from "./ask-primary.js";
+import { proxyBaseUrl } from "../llama-progress.js";
 
 function asArray(v: any): any[] {
   const resolved = typeof v === "function" ? v() : v;
@@ -65,10 +70,16 @@ function framing(cwd: string, role?: string): string[] {
       return false;
     }
   });
-  if (!present.length) return [];
-  return [
-    `${present.join(", ")} in your working directory are yours, not reference material about someone else. Each opens with a block saying what it is for; follow it.`,
-  ];
+  const lines: string[] = [...audioSystemRules(), BROWSER_READING_RULE, BROWSER_SCREENSHOT_RULE];
+  if (present.length) {
+    lines.push(
+      `${present.join(", ")} in your working directory are yours, not reference material about someone else. Each opens with a block saying what it is for; follow it.`,
+    );
+  }
+  // The bracketed-ref trap that used to need a line here is handled in the
+  // guard now, which normalises the argument for every session whether it
+  // reads this or not. Nothing to say, so nothing spent saying it.
+  return lines;
 }
 
 /**
@@ -88,6 +99,38 @@ export function builtinSkillsDir(): string | undefined {
     if (existsSync(candidate)) return candidate;
   }
   return undefined;
+}
+
+/**
+ * Route a llama.cpp model through the portal's progress proxy.
+ *
+ * Only llama.cpp: it is the one provider that reports how far along a prompt
+ * is, and the one where prefill is slow enough to be worth showing. Everything
+ * else is returned untouched, and so is a llama model when there is no proxy —
+ * a missed indicator is not a reason to fail to start.
+ */
+function viaProgressProxy<T extends { provider?: string; baseUrl?: string }>(
+  model: T | undefined,
+  sessionId: string | undefined,
+): T | undefined {
+  if (!model || !sessionId || !model.baseUrl || !isLlama(model.provider)) return model;
+  // Already routed. Wrapping it again would nest one proxy path inside another.
+  if (model.baseUrl.includes("/s/" + sessionId)) return model;
+  const rerouted = proxyBaseUrl(sessionId, model.baseUrl);
+  if (!rerouted) return model;
+  console.log(`[portal] prefill progress for ${sessionId}: ${model.baseUrl} -> ${rerouted}`);
+  return { ...model, baseUrl: rerouted };
+}
+
+/**
+ * Both ways a llama.cpp server shows up.
+ *
+ * pi has a built-in provider called `llama.cpp`, and the `pi-llama-cpp` package
+ * registers one per server as `llama-server=<url>`. This deployment uses the
+ * second, so matching only the first meant the reroute never once ran.
+ */
+function isLlama(provider: string | undefined): boolean {
+  return provider === "llama.cpp" || (provider?.startsWith("llama-server") ?? false);
 }
 
 /** Read a member that may be a getter or a method, without assuming which. */
@@ -110,8 +153,12 @@ function callable(obj: any, key: string): any {
  */
 export class SdkPiClient extends EventEmitter implements PiClient {
   private disposed = false;
+  private canvases?: CanvasTools;
+  private voiceFirst?: VoiceFirstTurn;
   /** Dialogs an extension is waiting on, keyed by request id. */
   private pendingUi = new Map<string, (r: { cancelled?: boolean; value?: unknown }) => void>();
+  /** The portal's own id for this conversation — what prefill progress is reported against. */
+  portalSessionId?: string;
 
   private constructor(
     private readonly session: any,
@@ -148,6 +195,8 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     sessionId?: string;
     /** False lets a run act on what it read — see guardExtension. */
     enforceTaint?: boolean;
+    /** Read at each tool call, so a change takes effect without a restart. */
+    browserNow?: () => { allowed: boolean; allowlist: string[] };
   }): Promise<SdkPiClient> {
     // Imported lazily so the server still boots (and the container executor
     // still works) if the SDK cannot initialise in this environment.
@@ -158,6 +207,8 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     // Without an explicit loader the SDK starts with no extensions, skills or
     // prompt templates — so installed packages contribute no commands at all.
     // The CLI wires this up for you; here it has to be asked for.
+    const voiceFirst = new VoiceFirstTurn();
+    const canvases = opts.sessionId ? new CanvasTools(opts.sessionId) : undefined;
     let resourceLoader: any;
     try {
       // Both are required: the constructor resolves each and throws on
@@ -166,13 +217,16 @@ export class SdkPiClient extends EventEmitter implements PiClient {
       // Every session, unconditionally: the point is to limit what a turn can do
       // after it reads something untrusted, and any session can read something.
       const factories: { name: string; factory: (pi: any) => void }[] = [
+        { name: "voice-first", factory: voiceFirst.extension },
         { name: "guard", factory: guardExtension(
             opts.sessionDir,
             opts.whoNow ?? (() => ({ role: "primary" })),
             opts.sessionId,
             opts.enforceTaint !== false,
+            opts.browserNow ?? (() => ({ allowed: false, allowlist: [] })),
           ) },
       ];
+      if (canvases) factories.push({ name: "canvases", factory: canvases.extension });
       if (opts.routineTools)
         factories.push({ name: "routines", factory: routineTools(opts.sessionId) });
       // Only where it means something: a conversation with the primary user has
@@ -224,7 +278,10 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     // only becomes findable further down, after bindExtensions.
     const wanted =
       opts.provider && opts.modelId ? { provider: opts.provider, modelId: opts.modelId } : undefined;
-    const model = wanted ? modelRuntime.getModel(wanted.provider, wanted.modelId) : undefined;
+    const model = viaProgressProxy(
+      wanted ? modelRuntime.getModel(wanted.provider, wanted.modelId) : undefined,
+      opts.sessionId,
+    );
 
     // Reopen the exact file this portal session owns, rather than creating a
     // new one — `create` started a fresh conversation on every restart, which
@@ -252,7 +309,12 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     });
 
     const client = new SdkPiClient(session, modelRuntime, () => {});
-    const unsub = session.subscribe((event: any) => client.emit("event", event));
+    client.portalSessionId = opts.sessionId;
+    client.canvases = canvases;
+    if (resourceLoader) {
+      client.voiceFirst = voiceFirst;
+    }
+    const unsub = session.subscribe((event: any) => { canvases?.observe(event); client.emit("event", event); });
     // Replace the placeholder now that we have the real unsubscribe.
     (client as any).unsubscribe = typeof unsub === "function" ? unsub : () => {};
 
@@ -287,7 +349,10 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     // Second attempt: the provider may only exist now that extensions are
     // bound. Without this the session silently ran on pi's fallback model.
     if (wanted && !model) {
-      const late = modelRuntime.getModel(wanted.provider, wanted.modelId);
+      const late = viaProgressProxy(
+        modelRuntime.getModel(wanted.provider, wanted.modelId),
+        opts.sessionId,
+      );
       if (late) {
         try {
           await session.setModel(late);
@@ -299,6 +364,18 @@ export class SdkPiClient extends EventEmitter implements PiClient {
           `[portal] model ${wanted.provider}/${wanted.modelId} not found; using pi's default`
         );
       }
+    }
+
+    // The portal only ever names a model when somebody picked one; most
+    // sessions run on pi's own default, which is chosen in here and never
+    // passes through the code above. Route whatever it settled on, or prefill
+    // progress only ever appears for a session whose model was set by hand.
+    try {
+      const settled = session.model;
+      const routed = viaProgressProxy(settled, opts.sessionId);
+      if (routed && routed !== settled) await session.setModel(routed);
+    } catch (e) {
+      console.error(`[portal] could not route llama progress: ${(e as Error).message}`);
     }
 
     return client;
@@ -323,9 +400,13 @@ export class SdkPiClient extends EventEmitter implements PiClient {
       new Promise((resolve) => {
         const id = randomUUID();
         let settled = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const abort = () => finish(fallback);
         const finish = (value: unknown) => {
           if (settled) return;
           settled = true;
+          clearTimeout(timer);
+          opts?.signal?.removeEventListener?.("abort", abort);
           this.pendingUi.delete(id);
           resolve(value);
         };
@@ -333,12 +414,14 @@ export class SdkPiClient extends EventEmitter implements PiClient {
 
         // Never park forever — an unanswered dialog would wedge the session.
         const ms = typeof opts?.timeout === "number" ? opts.timeout : 300_000;
-        const timer = setTimeout(() => {
+        timer = setTimeout(() => {
+          if (settled) return;
           this.emit("event", { type: "extension_ui_cancel", id });
           finish(fallback);
         }, ms);
         if (typeof timer.unref === "function") timer.unref();
-        opts?.signal?.addEventListener?.("abort", () => finish(fallback));
+        opts?.signal?.addEventListener?.("abort", abort, { once: true });
+        if (opts?.signal?.aborted) { abort(); return; }
 
         this.emit("event", { type: "extension_ui_request", id, ...payload });
       });
@@ -381,28 +464,51 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     return true;
   }
 
-  async prompt(message: string): Promise<void> {
-    // expandPromptTemplates lets "/name" resolve to its template or extension
-    // command, which is how the TUI treats the same input.
-    await this.session.prompt(message, { expandPromptTemplates: true });
+  async prompt(message: string, options?: { voice?: boolean }): Promise<void> {
+    if (options?.voice) {
+      this.voiceFirst?.arm(this.isIdle());
+    } else {
+      this.voiceFirst?.reset();
+    }
+    const promptOptions = { expandPromptTemplates: true, streamingBehavior: "followUp" };
+    try {
+      if (options?.voice) {
+        await acceptPrompt(
+          preflightResult => this.session.prompt(audioMessage(message), { ...promptOptions, preflightResult }),
+          error => {
+            this.voiceFirst?.reset();
+            this.emit("event", { type: "portal_notice", text: `Voice turn failed: ${error instanceof Error ? error.message : error}`, error: true });
+          },
+        );
+      } else await this.session.prompt(message, promptOptions);
+    } catch (error) { if (options?.voice) this.voiceFirst?.reset(); throw error; }
   }
 
   async abort(): Promise<void> {
-    await this.session.abort();
+    // Compaction runs on a controller of its own, so session.abort() stops an
+    // agent run and leaves a summarisation going — the one case where Stop
+    // looks like it did nothing at all.
+    if (this.session.isCompacting) this.session.abortCompaction();
+    try { await this.session.abort(); } finally { this.canvases?.interrupt(); }
   }
 
-  /** True when nothing is streaming — a command that ran no agent turn is idle. */
+  /**
+   * True when nothing is streaming — a command that ran no agent turn is idle.
+   *
+   * `isIdle` and `isStreaming` are getters, not methods. Calling them threw
+   * every time, the throw was swallowed, and this answered "idle" for a session
+   * that was mid-run — which is why the Stop button kept vanishing while the
+   * model was still working. It also covers a queued follow-up and a retry,
+   * neither of which ends at agent_end.
+   */
   isIdle(): boolean {
-    try {
-      return this.session.isIdle?.() ?? !this.session.isStreaming?.();
-    } catch {
-      return true;
-    }
+    return this.session.isIdle;
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.canvases?.interrupt();
     try {
       this.unsubscribe();
     } catch {
@@ -498,11 +604,24 @@ export class SdkPiClient extends EventEmitter implements PiClient {
   async setModel(provider: string, modelId: string): Promise<void> {
     const model = this.modelRuntime.getModel(provider, modelId);
     if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
-    await this.session.setModel(model);
+    await this.session.setModel(viaProgressProxy(model, this.portalSessionId) ?? model);
   }
 
   async setThinkingLevel(level: string): Promise<void> {
     this.session.setThinkingLevel(level);
+  }
+
+  /**
+   * Re-read pi's settings file into this session.
+   *
+   * A session takes a copy of the settings when it starts, so a compaction
+   * tuned in the UI would otherwise not reach anything already open — and the
+   * session you are looking at when you change it is exactly the one you meant.
+   * Only the file is re-read; anything set on this session was written there
+   * too, so nothing is lost.
+   */
+  async refreshSettings(): Promise<void> {
+    await this.session.settingsManager?.reload?.();
   }
 
   async setAutoCompaction(enabled: boolean): Promise<void> {

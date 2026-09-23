@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { inlineBrowserScreenshot } from "./browser-screenshot.js";
+import { cleanBrowserSnapshot, isBrowserSnapshot } from "./browser-snapshot-format.js";
 import { listToolRules, recordAudit, useGrant, type ToolRule } from "../db.js";
 
 /**
@@ -27,7 +29,7 @@ import { listToolRules, recordAudit, useGrant, type ToolRule } from "../db.js";
  */
 
 /** Commands whose output is somebody else's words. */
-const UNTRUSTED_COMMAND = /\b(himalaya|mutt|neomutt|notmuch|offlineimap|mbsync|curl|wget|lynx|w3m)\b/;
+const UNTRUSTED_COMMAND = /\b(himalaya|mutt|neomutt|notmuch|offlineimap|mbsync|curl|wget|lynx|w3m|ssh|scp)\b|\bgit\s+(?:clone|fetch|pull)\b|\b(?:npm|pnpm|yarn|pip3?|uv)\s+(?:install|add|sync)\b/;
 
 interface Rule {
   name: string;
@@ -48,7 +50,10 @@ const target = (input: Record<string, unknown>) =>
       : "";
 
 /** Directories on PATH: a file here is executed later, by something else. */
-const PATH_DIRS = /(^|[^\w/])(\/data\/bin|\/usr\/local\/bin|\/usr\/bin|\/usr\/local\/sbin)\//;
+const PATH_DIRS = /(^|[^\w/])(\/data\/bin|\/usr\/local\/bin|\/usr\/bin|\/usr\/local\/sbin)(?=\/|[\s'"]|$)/;
+
+const PERSIST_PATHS = /(?:\/etc\/(?:cron\.[a-z]+|systemd\/system)|(?:~|\/[^\s]+)\/\.config\/(?:autostart|systemd\/user)|(?:~|\/[^\s]+)\/\.(?:bashrc|bash_profile|zshrc|zprofile|profile))(?=\/|[\s'"]|$)/;
+const writesFiles = (command: string) => /(>|\b(?:cp|mv|install|tee)\b)/.test(command);
 
 const RULES: Rule[] = [
   {
@@ -73,7 +78,7 @@ const RULES: Rule[] = [
     hit: (tool, input) =>
       tool === "bash" &&
       /\b(curl|wget)\b/.test(cmd(input)) &&
-      /(\s-d\b|--data|\s-F\b|--form|--upload-file|\s-T\b|-X\s*(POST|PUT|PATCH)|--post-file)/.test(
+      /(\s-d\b|--data|\s-F\b|--form|--upload-file|\s-T\b|-X\s*(POST|PUT|PATCH)|--post-file|--json)/.test(
         cmd(input),
       ),
   },
@@ -82,7 +87,7 @@ const RULES: Rule[] = [
     why: "reading secrets it was not asked about",
     hit: (tool, input) => {
       const where = tool === "bash" ? cmd(input) : target(input);
-      return /(auth\.json|\.secrets|\.env\b|id_[re]d?sa|\.ssh\/|credentials|\.netrc|token)/i.test(
+      return /(auth\.json|\.secrets|\.env\b|id_(?:rsa|dsa|ecdsa|ed25519)|\.ssh\/|credentials|\.netrc|token)/i.test(
         where,
       );
     },
@@ -98,7 +103,9 @@ const RULES: Rule[] = [
     hit: (tool, input) =>
       tool === "routine_create" ||
       tool === "routine_update" ||
-      (tool === "bash" && /\b(crontab|systemd-run|at\s+now)\b/.test(cmd(input))),
+      ((tool === "write" || tool === "edit") && PERSIST_PATHS.test(target(input))) ||
+      (tool === "bash" && (/\b(crontab|systemd-run|at\s+now)\b/.test(cmd(input)) ||
+        (PERSIST_PATHS.test(cmd(input)) && writesFiles(cmd(input))))),
   },
 ];
 
@@ -143,6 +150,117 @@ const envelope = (id: string) => ({
  * would freeze capability to whoever happened to speak first.
  */
 const READ_ONLY = new Set(["read", "grep", "find", "ls", "ask_primary"]);
+
+/**
+ * Driving the agent's browser, in either of the two shapes the MCP adapter
+ * offers: a directly registered tool named for its server, or the proxy tool
+ * carrying the same thing as an argument.
+ *
+ * The browser is signed into the agent's own accounts, so a session holding it
+ * can act as the agent anywhere it has a login. That is a capability, not a
+ * read — it is off unless somebody turned it on.
+ */
+/**
+ * A snapshot prints refs as `[ref=f1e17]`, and pasting that in whole is the
+ * obvious thing to do. Playwright reads a bracketed value as a CSS attribute
+ * selector, matches nothing, and reports it as "does not match any elements" —
+ * which reads like the ref expired, so the next move is to take another
+ * snapshot and get the same result. Agents have burned whole sessions on it.
+ *
+ * Telling the model the convention did not hold. This normalises the argument
+ * on the way past instead, which is deterministic.
+ */
+/**
+ * Playwright's own ref shape: frame then element, `f1e17`, or bare `e17`.
+ * Distinctive enough to tell a ref from an attribute selector — nobody writes
+ * `[e17]` meaning an element with an `e17` attribute.
+ */
+const REF_TOKEN = /^(?:f\d+)?e\d+$/;
+
+/**
+ * Peel off the decoration and keep it only if a ref is what is underneath.
+ *
+ * Shape-based rather than a list of known mistakes: the first version matched
+ * `[ref=x]` exactly, the model moved to `[x]` the next day, and the same error
+ * came back. Anything that does not reduce to a ref is returned exactly as it
+ * arrived, so real selectors — `[disabled]`, `a[href="..."]`, `#id` — are
+ * never touched.
+ */
+function bareRef(value: string): string {
+  const stripped = value
+    .trim()
+    .replace(/^\[|\]$/g, "")
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .trim()
+    .replace(/^(?:aria-)?ref\s*=\s*/i, "")
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .trim();
+  return REF_TOKEN.test(stripped) ? stripped : value;
+}
+
+/**
+ * Playwright's element argument, whatever shape it arrives in.
+ *
+ * `target` is current; `ref` was its name until @playwright/mcp changed the
+ * signature, and a model that learned the old one keeps sending it. Both are
+ * accepted here rather than failing on a difference of spelling.
+ */
+function normaliseTarget(input: unknown): void {
+  if (!input || typeof input !== "object") return;
+  const o = input as Record<string, unknown>;
+  // A single-element array turns up too, from a model reading the snapshot's
+  // `[ref=x]` as list syntax.
+  if (Array.isArray(o.target) && o.target.length === 1 && typeof o.target[0] === "string") {
+    o.target = o.target[0];
+  }
+  if (typeof o.target === "string") o.target = bareRef(o.target);
+  else if (typeof o.ref === "string") o.target = bareRef(o.ref);
+  // fill_form carries one of these per field.
+  if (Array.isArray(o.fields)) for (const field of o.fields) normaliseTarget(field);
+}
+
+function browserCall(
+  toolName: string,
+  input: Record<string, unknown>
+): { isBrowser: boolean; url?: string } {
+  // Matched anywhere, not anchored. Playwright's own tools are browser_navigate,
+  // browser_click and so on, so the server prefix puts the telling part in the
+  // middle: browser_browser_navigate, playwright_browser_navigate. Anchoring
+  // meant a second browser server slipped the gate entirely.
+  const direct = /(^|[_.])browser[_.]/i.test(toolName);
+  const viaProxy =
+    toolName === "mcp" &&
+    ["server", "connect", "tool", "describe"].some((k) =>
+      typeof input[k] === "string" ? /browser/i.test(input[k] as string) : false
+    );
+  if (!direct && !viaProxy) return { isBrowser: false };
+
+  // The URL, wherever this shape happens to put it.
+  const args = (input.args ?? input) as Record<string, unknown>;
+  const url = typeof args?.url === "string" ? args.url : undefined;
+  return { isBrowser: true, url };
+}
+
+/** Does a host match one of the allowlist globs? `*.example.com` covers a sub. */
+function hostAllowed(url: string, allow: string[]): boolean {
+  if (!allow.length) return true;
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return allow.some((pattern) => {
+    const p = pattern.toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+    if (p.startsWith("*.")) {
+      const base = p.slice(2);
+      return host === base || host.endsWith(`.${base}`);
+    }
+    return host === p;
+  });
+}
 
 /**
  * Chaining, redirection and substitution.
@@ -222,7 +340,16 @@ export function guardExtension(
    * the session and the fix is a push. The envelope still marks the content:
    * labelling costs nothing and is the half that never gets in the way.
    */
-  enforceTaint = true
+  enforceTaint = true,
+  /**
+   * Whether this session may drive the browser, read at each call rather than
+   * fixed at launch — turning it on should work now, not after a restart
+   * nobody knows to perform.
+   */
+  browserNow: () => { allowed: boolean; allowlist: string[] } = () => ({
+    allowed: false,
+    allowlist: [],
+  })
 ) {
   return (pi: any): void => {
     // Per session, not global: a taint belongs to the conversation that read the
@@ -230,16 +357,20 @@ export function guardExtension(
     let tainted = false;
 
     pi.on("tool_result", (event: any) => {
+      const compact = !event.isError && isBrowserSnapshot(event.toolName, event.input ?? {});
+      const formatted = compact ? (event.content ?? []).map((part: any) =>
+        part?.type === 'text' && typeof part.text === 'string' ? { ...part, text: cleanBrowserSnapshot(part.text) } : part,
+      ) : event.content;
       const source =
         event.toolName === "bash" ? cmd(event.input ?? {}) : String(event.toolName ?? "");
       // MCP tools reach servers the portal does not control, so their output is
       // treated the same way as mail: someone else's words.
       const untrusted = UNTRUSTED_COMMAND.test(source) || /^mcp(_|$)/.test(source);
-      if (!untrusted || event.isError) return undefined;
+      if (!untrusted) return compact ? { content: formatted } : undefined;
 
       tainted = true;
       const { open, close } = envelope(randomBytes(8).toString("hex"));
-      const content = (Array.isArray(event.content) ? event.content : []).map((part: any) =>
+      const content = (Array.isArray(formatted) ? formatted : []).map((part: any) =>
         part?.type === "text" && typeof part.text === "string"
           ? { ...part, text: deface(part.text) }
           : part,
@@ -251,8 +382,6 @@ export function guardExtension(
 
     pi.on("tool_call", (event: any) => {
       const { role, key } = whoNow();
-      // A one-off approval, spent here. Checked last, after the standing rules,
-      // because it is the expensive kind of permission: somebody was asked.
       const subject = subjectOf(event.toolName, event.input ?? {}).trim();
       const note = (kind: string, reason: string) =>
         recordAudit({
@@ -264,6 +393,40 @@ export function guardExtension(
           sessionId: portalSessionId,
         });
 
+      // The browser is gated on the session, not on who is speaking: the agent
+      // has its own accounts and uses them as itself, including when it is
+      // helping somebody else.
+      const asBrowser = browserCall(event.toolName, event.input ?? {});
+      if (asBrowser.isBrowser) {
+        inlineBrowserScreenshot(event.toolName, event.input);
+        // Mutated in place — that is how pi takes an argument change.
+        normaliseTarget(event.input);
+        const browser = browserNow();
+        if (!browser.allowed) {
+          note("refused", "The browser is not enabled for this session");
+          return {
+            block: true,
+            reason:
+              "Refused: this session cannot drive the browser. It is enabled per session and " +
+              "per routine, and nobody has enabled it here. Say so rather than looking for " +
+              "another way to reach the page.",
+          };
+        }
+        if (asBrowser.url && !hostAllowed(asBrowser.url, browser.allowlist)) {
+          note("refused", `Outside the browser allowlist: ${asBrowser.url}`);
+          return {
+            block: true,
+            reason:
+              `Refused: ${asBrowser.url} is not on the browser allowlist. Tell whoever asked ` +
+              "which domain you needed; do not try a different route to the same place.",
+          };
+        }
+        // Allowed, and recorded. Where the agent has been is the thing worth
+        // being able to read back later.
+        if (asBrowser.url) note("browsed", asBrowser.url);
+      }
+      // A one-off approval, spent here. Checked last, after the standing rules,
+      // because it is the expensive kind of permission: somebody was asked.
       const granted = () => {
         const ok = Boolean(
           portalSessionId && useGrant(portalSessionId, event.toolName, subject)

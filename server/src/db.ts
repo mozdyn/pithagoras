@@ -48,6 +48,8 @@ export interface SessionRow {
   role: "primary" | "colleague" | "guest" | "unknown";
   /** Who last spoke here, surviving a restart that empties the in-memory map. */
   last_person_key: string | null;
+  /** May this session drive the agent's browser? Off unless turned on. */
+  browser: number;
 }
 
 export interface EventRow {
@@ -94,6 +96,19 @@ export function getDb(): Database.Database {
     -- Every event pi emits is appended here. This is what makes the portal
     -- fire-and-forget: a browser that reconnects days later replays from its
     -- last seen seq instead of having missed the run entirely.
+    CREATE TABLE IF NOT EXISTS canvases (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL DEFAULT '',
+      revision INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'saved',
+      active_call TEXT,
+      agent_read_revision INTEGER,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_canvases_session ON canvases(session_id);
+
     CREATE TABLE IF NOT EXISTS events (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
@@ -294,6 +309,9 @@ function migrate(d: Database.Database): void {
   // The lowest role this session has ever served. Ratchets down and never up:
   // once a guest has spoken in a conversation, the private context files stay
   // out of it even if the next message is from the primary user.
+  if (!names.includes("browser")) {
+    d.exec("ALTER TABLE sessions ADD COLUMN browser INTEGER NOT NULL DEFAULT 0");
+  }
   if (!names.includes("last_person_key")) {
     d.exec("ALTER TABLE sessions ADD COLUMN last_person_key TEXT");
   }
@@ -351,6 +369,9 @@ function migrate(d: Database.Database): void {
   }
   if (routineCols.length && !routineCols.includes("guard")) {
     d.exec("ALTER TABLE routines ADD COLUMN guard INTEGER NOT NULL DEFAULT 1");
+  }
+  if (routineCols.length && !routineCols.includes("browser")) {
+    d.exec("ALTER TABLE routines ADD COLUMN browser INTEGER NOT NULL DEFAULT 0");
   }
   d.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_slug ON routines(slug)");
   d.exec("CREATE INDEX IF NOT EXISTS idx_notes_pending ON notes(session_id, consumed_at)");
@@ -480,19 +501,37 @@ export function updateSession(
 
 export function deleteSession(id: string): void {
   const d = getDb();
+  d.prepare("DELETE FROM canvases WHERE session_id = ?").run(id);
   d.prepare("DELETE FROM events WHERE session_id = ?").run(id);
   d.prepare("DELETE FROM sessions WHERE id = ?").run(id);
 }
 
+/**
+ * When an event happened, in epoch milliseconds.
+ *
+ * SQLite writes `datetime('now')` as UTC with no zone marker, which JS parses
+ * as local time — an hour or ten out, depending on where the portal runs. The
+ * live path writes a real ISO string, so both shapes turn up in the same table.
+ */
+export function eventTime(createdAt: string | undefined): number | undefined {
+  if (!createdAt) return undefined;
+  const iso = /[Zz]|[+-]\d\d:?\d\d$/.test(createdAt)
+    ? createdAt
+    : createdAt.replace(" ", "T") + "Z";
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
 export function appendEvent(sessionId: string, type: string, payload: unknown): EventRow {
+  const encodedPayload = JSON.stringify(payload);
   const info = getDb()
     .prepare("INSERT INTO events (session_id, type, payload) VALUES (?, ?, ?)")
-    .run(sessionId, type, JSON.stringify(payload));
+    .run(sessionId, type, encodedPayload);
   return {
     seq: Number(info.lastInsertRowid),
     session_id: sessionId,
     type,
-    payload: JSON.stringify(payload),
+    payload: encodedPayload,
     created_at: new Date().toISOString(),
   };
 }
@@ -513,6 +552,73 @@ export function replayStart(sessionId: string, keep: number): number {
     )
     .get(sessionId, keep) as { seq: number } | undefined;
   return row?.seq ?? 0;
+}
+
+/** Every message the portal sent to the agent in this session, oldest first. */
+export function sentMessages(sessionId: string): { seq: number; message: string }[] {
+  const rows = getDb()
+    .prepare("SELECT seq, payload FROM events WHERE session_id = ? AND type = 'portal_prompt' ORDER BY seq ASC")
+    .all(sessionId) as { seq: number; payload: string }[];
+  return rows.map((r) => ({ seq: r.seq, message: String(JSON.parse(r.payload)?.message ?? "") }));
+}
+
+/**
+ * Drops a stretch of a session's transcript: `from` up to, not including, `to` — or to the end.
+ * Returns what it removed, so the caller can put it back.
+ */
+export function deleteEventsBetween(sessionId: string, from: number, to: number | null): EventRow[] {
+  const db = getDb();
+  return db.transaction(() => {
+    const rows = db
+      .prepare("SELECT * FROM events WHERE session_id = ? AND seq >= ? AND (? IS NULL OR seq < ?) ORDER BY seq ASC")
+      .all(sessionId, from, to, to) as EventRow[];
+    db.prepare("DELETE FROM events WHERE session_id = ? AND seq >= ? AND (? IS NULL OR seq < ?)").run(
+      sessionId,
+      from,
+      to,
+      to,
+    );
+    return rows;
+  })();
+}
+
+/** Puts events back under the seq they had — the inverse of deleteEventsBetween. */
+export function restoreEvents(rows: EventRow[]): void {
+  const db = getDb();
+  const insert = db.prepare(
+    "INSERT OR REPLACE INTO events (seq, session_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+  );
+  db.transaction(() => {
+    for (const r of rows) insert.run(r.seq, r.session_id, r.type, r.payload, r.created_at);
+  })();
+}
+
+/**
+ * The highest seq ever handed out, deleted events included: everything recorded
+ * from now on is greater. Read from the sequence rather than the table, because
+ * the newest rows may be the ones just removed.
+ */
+export function latestSeq(): number {
+  const row = getDb().prepare("SELECT seq FROM sqlite_sequence WHERE name = 'events'").get() as
+    | { seq: number }
+    | undefined;
+  return row?.seq ?? 0;
+}
+
+/** Drops one event. */
+export function deleteEvent(seq: number): void {
+  getDb().prepare("DELETE FROM events WHERE seq = ?").run(seq);
+}
+
+/** The page before a cursor, oldest first — what a transcript scrolls back into. */
+export function eventsBefore(sessionId: string, before: number, limit = 1500): EventRow[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM (
+         SELECT * FROM events WHERE session_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?
+       ) ORDER BY seq ASC`
+    )
+    .all(sessionId, before, limit) as EventRow[];
 }
 
 export function eventsSince(sessionId: string, since = 0, limit = 5000): EventRow[] {
@@ -650,15 +756,20 @@ export function takeDeliveries(sessionId: string): string[] {
   return rows.map((r) => r.text);
 }
 
-/** Take the pending notes for a conversation. Reading them consumes them. */
-export function takeNotes(sessionId: string): string[] {
-  const rows = getDb()
-    .prepare("SELECT id, text FROM notes WHERE session_id = ? AND consumed_at IS NULL ORDER BY id ASC")
+/** Read pending notes without consuming them before the prompt is accepted. */
+export function pendingNotes(sessionId: string): { id: number; text: string }[] {
+  return getDb().prepare("SELECT id, text FROM notes WHERE session_id = ? AND consumed_at IS NULL ORDER BY id ASC")
     .all(sessionId) as { id: number; text: string }[];
-  if (!rows.length) return [];
-  const mark = getDb().prepare("UPDATE notes SET consumed_at = datetime('now') WHERE id = ?");
-  for (const r of rows) mark.run(r.id);
-  return rows.map((r) => r.text);
+}
+export function consumeNotes(sessionId: string, ids: number[]): void {
+  const mark = getDb().prepare("UPDATE notes SET consumed_at = datetime('now') WHERE id = ? AND session_id = ?");
+  getDb().transaction(() => { for (const id of ids) mark.run(id, sessionId); })();
+}
+/** Legacy callers that intentionally consume immediately. */
+export function takeNotes(sessionId: string): string[] {
+  const rows = pendingNotes(sessionId);
+  consumeNotes(sessionId, rows.map(r => r.id));
+  return rows.map(r => r.text);
 }
 
 export interface ToolRule {
@@ -728,7 +839,7 @@ export interface AuditRow {
 }
 
 /** Keeps the log from growing without bound; old entries are not evidence. */
-const AUDIT_KEEP = 2000;
+export const AUDIT_KEEP = 2000;
 
 export function recordAudit(entry: {
   kind: string;
@@ -765,4 +876,35 @@ export function routineGuards(slug: string | null | undefined): boolean {
     | { guard: number }
     | undefined;
   return row ? row.guard === 1 : true;
+}
+
+/** Does this session get the browser? Routines answer for their own runs. */
+export function browserAllowed(session: SessionRow): boolean {
+  if (session.kind === "routine" && session.routine_slug) {
+    const row = getDb().prepare("SELECT browser FROM routines WHERE slug = ?").get(
+      session.routine_slug
+    ) as { browser: number } | undefined;
+    return row ? row.browser === 1 : false;
+  }
+  return session.browser === 1;
+}
+
+/**
+ * Domains the browser may be pointed at, as globs. Empty means no restriction —
+ * the on/off switch is the gate, and a list nobody filled in should not quietly
+ * block everything.
+ */
+export function browserAllowlist(): string[] {
+  const raw = (getStoredSettings() as Record<string, string>).browser_allowlist ?? "";
+  return raw
+    .split(/[\n,]/)
+    .map((d) => d.trim())
+    .filter(Boolean);
+}
+
+export function setBrowserAllowlist(domains: string): void {
+  const upsert = getDb().prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  );
+  upsert.run("browser_allowlist", domains.trim());
 }
